@@ -2,7 +2,7 @@
 @Description: The utils file
 @Author: xieydd
 @Date: 2019-08-13 14:15:23
-@LastEditTime: 2019-09-24 10:55:54
+@LastEditTime: 2019-10-18 17:04:36
 @LastEditors: Please set LastEditors
 '''
 import logging
@@ -16,6 +16,7 @@ import csv
 import torchvision.transforms as transforms
 from torch.autograd import Variable
 import torch.nn.functional as F
+from torch import nn
 
 '''
 @description: count the params size
@@ -46,6 +47,25 @@ def shuffle_layer(x, groups):
     # flatten
     x = x.view(batchsize, -1, height, width)
     return x
+
+def make_divisible(v, divisor, min_val=None):
+    """
+    This function is taken from the original tf repo.
+    It ensures that all layers have a channel number that is divisible by 8
+    It can be seen here:
+    https://github.com/tensorflow/models/blob/master/research/slim/nets/mobilenet/mobilenet.py
+    :param v:
+    :param divisor:
+    :param min_val:
+    :return:
+    """
+    if min_val is None:
+        min_val = divisor
+    new_v = max(min_val, int(v + divisor / 2) // divisor * divisor)
+    # Make sure that round down does not go down by more than 10%.
+    if new_v < 0.9 * v:
+        new_v += divisor
+    return new_v
 
 def _data_transforms_cifar10(args):
   CIFAR_MEAN = [0.49139968, 0.48215827, 0.44653124]
@@ -133,8 +153,6 @@ def rescale(alpha, alpha_new, selecteds):
 def binarize(alpha, probability, select=1):
     selected = torch.multinomial(probability, select, replacement=False)
     selected = sorted(selected)
-    print(selected)
-    alpha = [alpha[i] for i in selected]
     return selected
 
 def weights_init(m, deepth=0, max_depth=2):
@@ -207,6 +225,12 @@ def get_logger(file_path):
     logger.setLevel(logging.INFO)
 
     return logger
+
+def write_log(log_path, log_str):
+    with open(log_path, 'a') as fout:
+        fout.write(log_str + '\n')
+        fout.flush()
+        print(log_str)
 
 def get_data(dataset, data_path, cutout_length, validation):
     """ Get torchvision dataset """
@@ -456,3 +480,21 @@ class Cutout(object):
         img *= mask
         return img
 
+def cross_entropy_with_label_smoothing(pred, target, label_smoothing=0.1):
+    logsoftmax = nn.LogSoftmax()
+    n_classes = pred.size(1)
+    # convert to one-hot
+    target = torch.unsqueeze(target, 1)
+    soft_target = torch.zeros_like(pred)
+    soft_target.scatter_(1, target, 1)
+    # label smoothing
+    soft_target = soft_target * \
+        (1 - label_smoothing) + label_smoothing / n_classes
+    return torch.mean(torch.sum(- soft_target * logsoftmax(pred), 1))
+
+def get_update_schedule_grad(nBatch, config):
+    schedule = {}
+    for i in range(nBatch):
+        if (i+1) % config.grad_update_arch_param_every == 0:
+            schedule[i] = config.grad_update_steps
+    return schedule

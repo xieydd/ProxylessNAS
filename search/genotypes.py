@@ -1,10 +1,17 @@
+'''
+@Description: In User Settings Edit
+@Author: your name
+@Date: 2019-09-28 23:38:08
+@LastEditTime: 2019-10-16 09:57:08
+@LastEditors: Please set LastEditors
+'''
 from collections import namedtuple
 
 Genotype = namedtuple('Genotype', 'normal normal_concat reduce reduce_concat')
 
 PRIMITIVES = [
-    'none',
-    'identity',
+    #'none',
+    #'identity',
     'mbconv_3_3',
     'mbconv_3_5',
     'mbconv_3_7',

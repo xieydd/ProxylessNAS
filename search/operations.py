@@ -2,20 +2,19 @@
 @Description: Change operation to class inheritance, and implement more operation function
 @Author: xieydd
 @Date: 2019-09-11 19:46:33
-@LastEditTime: 2019-09-24 11:53:16
+@LastEditTime: 2019-10-18 15:32:44
 @LastEditors: Please set LastEditors
 '''
 import torch
 import torch.nn as nn
 from collections import OrderedDict
 import sys
-sys.path.append("../../")
+sys.path.append("../")
 import utils
 
 OPS = {
-  'none': lambda C_in, C_out, stride, affine: Zero(stride),
   #'identity': lambda C_in, C_out, stride, affine: Identity() if stride == 1 else FactorizedReduce(C_in, C_out, affine),
-  'identity': lambda C_in, C_out, stride, affine: Identity_New(C_in, C_out, stride),
+  #'identity': lambda C_in, C_out, stride, affine: Identity(C_in, C_out, stride),
   'mbconv_3_3': lambda C_in, C_out, stride, affine: MBConv(C_in, C_out, 3, stride, 1, 3, affine),
   'mbconv_3_5': lambda C_in, C_out, stride, affine: MBConv(C_in, C_out, 5, stride, 2, 3, affine),
   'mbconv_3_7': lambda C_in, C_out, stride, affine: MBConv(C_in, C_out, 7, stride, 3, 3, affine),
@@ -24,35 +23,40 @@ OPS = {
   'mbconv_6_7': lambda C_in, C_out, stride, affine: MBConv(C_in, C_out, 7, stride, 3, 6, affine),
 }
 
+OPS_ZERO = {
+  'zero': lambda C_in, C_out, stride, affine: Zero(stride),
+}
+
 SEARCH_SPACE = OrderedDict([
     #### table 1. input shapes of 26 searched layers (considering with strides)
     # Note: the second and third dimentions are recommended (will not be used in training) and written just for debagging
     ("input_shape", [(32, 112, 112),
-                     (16, 112, 112), (24, 56, 56),  (24, 56, 56),  (24, 56, 56),
-                     (24, 56, 56), (32, 56, 56),  (32, 56, 56),  (32, 56, 56),
-                     (32, 56, 56), (40, 28, 28), (40, 28, 28), (40, 28, 28),
-                     (40, 28, 28), (80, 14, 14),  (80, 14, 14),  (80, 14, 14),
-                     (80, 14, 14), (96, 14, 14), (96, 14, 14), (96, 14, 14),
-                     (96, 14, 14),  (192, 7, 7),   (192, 7, 7),   (192, 7, 7),
-                     (192,7,7), (320, 7, 7)]),
+                     (16, 112, 112), 
+                     (24, 56, 56),  (24, 56, 56),  (24, 56, 56), (24, 56, 56), 
+                     #(32, 56, 56),  (32, 56, 56),  (32, 56, 56), (32, 56, 56), 
+                     (40, 28, 28), (40, 28, 28), (40, 28, 28), (40, 28, 28), 
+                     (80, 14, 14), (80, 14, 14),  (80, 14, 14), (80, 14, 14), 
+                     (96, 14, 14), (96, 14, 14), (96, 14, 14), (96, 14, 14), 
+                     (192, 7, 7), (192, 7, 7), (192, 7, 7), (192,7,7), 
+                     (320, 7, 7)]),
     # table 1. filter numbers over the 26 layers 1280 if for fc layer
-    ("channel_size", [32,  16,
-                      24,  24,  24,  24,
-                      32,  32,  32,  32,
-                      40,  40,  40,  40,
-                      80,  80,  80,  80,
+    ("channel_size", [32,16,
+                      24,  24,  24, 24,
+                      #32,  32,  32,  32, #TODO delete
+                      40,  40,  40, 40, 
+                      80,  80,  80, 80,
                       96, 96, 96, 96,
                       192, 192, 192, 192,
-                      320, 1280]),
+                      320, 1280, 1000]),
     # table 1. strides over the 26 layers
-    ("strides", [1,
-                 2, 1, 1, 1,
+    ("strides", [1,2,
+                 1, 1, 1, 2,
+                 #1, 1, 1, 1, #TODO delete
+                 1, 1, 1, 2,
                  1, 1, 1, 1,
-                 2, 1, 1, 1,
-                 2, 1, 1, 1,
+                 1, 1, 1, 2,
                  1, 1, 1, 1,
-                 2, 1, 1, 1,
-                 1, 1])
+                 1,1, 1])
 ])
 
 def depthwise_conv(in_channels, kernel_size, stride, groups, affine):
@@ -76,6 +80,9 @@ class ConvBNReLU(nn.Module):
       x = self.act(x)
     return x
 
+  def get_flops(self, x):
+    return utils.count_conv_flop(self.conv,x), self.forward(x)
+
 
 class MBConv(nn.Module):
   def __init__(self, C_in, C_out, kernel_size, stride, padding, expansion_factor, affine=True):
@@ -93,11 +100,17 @@ class MBConv(nn.Module):
     self.inverted_bottleneck = ConvBNReLU(C_in, C_exp, 1, 1, 0, affine=affine)
     self.depth_wise = depthwise_conv(C_exp, kernel_size, stride, C_exp, affine=affine) 
     self.point_wise = ConvBNReLU(C_exp, C_out, 1, 1, 0, activation=False, affine=affine)
-    self.op = nn.Sequential(
-      self.inverted_bottleneck,
-      self.depth_wise,
-      self.point_wise
-    )
+    if expansion_factor == 1:
+      self.op = nn.Sequential(
+        self.depth_wise,
+        self.point_wise
+      )
+    else:
+       self.op = nn.Sequential(
+        self.inverted_bottleneck,
+        self.depth_wise,
+        self.point_wise
+      )
 
   def forward(self, x):
     if self.res_connect:
@@ -118,7 +131,11 @@ class MBConv(nn.Module):
     x = self.depth_wise(x)
     flop3 = utils.count_conv_flop(self.point_wise.conv, x)
     x = self.point_wise(x)
-    return flop1 + flop2 + flop3
+    return flop1 + flop2 + flop3, x 
+
+  @staticmethod
+  def is_zero_layer():
+      return False
 
 class ReLUConvBN(nn.Module):
   def __init__(self, C_in, C_out, kernel_size, stride, padding, affine=True):
@@ -167,13 +184,16 @@ class SepConv(nn.Module):
     return self.op(x)
 
 
-class Identity(nn.Module):
+class Identity_old(nn.Module):
 
   def __init__(self):
-    super(Identity, self).__init__()
+    super(Identity_old, self).__init__()
 
   def forward(self, x):
     return x
+
+  def is_zero_layer(self):
+    return False
 
 
 class Zero(nn.Module):
@@ -202,6 +222,10 @@ class Zero(nn.Module):
   
   def unit_str(self):
     return "Zero"
+  
+  @staticmethod
+  def is_zero_layer():
+      return True
 
 class FactorizedReduce(nn.Module):
 
@@ -219,9 +243,9 @@ class FactorizedReduce(nn.Module):
     out = self.bn(out)
     return out
 
-class Identity_New(nn.Module):
+class Identity(nn.Module):
     def __init__(self, C_in, C_out, stride):
-      super(Identity_New, self).__init__()
+      super(Identity, self).__init__()
       self.conv = (ConvBNReLU(C_in, C_out, kernel_size=1,stride=stride, padding=0) if C_in != C_out or stride != 0 else None)
 
     def forward(self, x):
@@ -230,3 +254,9 @@ class Identity_New(nn.Module):
       else:
         out = x
       return out
+
+    def get_flops(self, x):
+      return 0, self.forward(x)
+
+    def is_zero_layer(self):
+      return False

@@ -4,5 +4,5 @@ Thanks for [kairos03](https://github.com/kairos03/ProxylessNAS-Pytorch) completi
 
 | 2019-9-18 | Can train, Bad result |
 | --------- | --------------------- |
-|           |                       |
+| 2019-10-31|    Office Released    |
 

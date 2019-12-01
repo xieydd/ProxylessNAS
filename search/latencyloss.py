@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from genotypes import PRIMITIVES
 import math
 
+
 class LatencyLoss(nn.Module):
     def __init__(self, config, channels, strides, input_size=112):
         super(LatencyLoss, self).__init__()
@@ -82,7 +83,8 @@ class LatencyLoss(nn.Module):
         if expected_loss is None:
             return ce_loss
         if config.grad_reg_loss_type == 'add#linear':
-            reg_loss = ce_loss + (expected_loss - config.ref_value)*config.grad_reg_loss_lambda / config.ref_value
+            reg_loss = ce_loss + (expected_loss - config.ref_value) * \
+                config.grad_reg_loss_lambda / config.ref_value
             latency_loss = reg_loss * ce_loss * config.grad_reg_loss_alpha
         elif config.grad_reg_loss_type == 'mul#log':
             reg_loss = (torch.log(expected_loss) / math.log(config.ref_value)
@@ -108,7 +110,7 @@ class LatencyLoss(nn.Module):
 
             # mixed ops
             for i, layer in enumerate(model.module.layers):
-            #for i, layer in enumerate(model.layers):
+                # for i, layer in enumerate(model.layers):
                 mbconv_name = layer.MixedOp.active_op_name
                 mbconv = layer.MixedOp.active_op
                 shortcut = layer.shortcut
@@ -117,11 +119,11 @@ class LatencyLoss(nn.Module):
                 else:
                     predicted_latency += self._predictor('{}_{}_{}_{}_{}'.format(
                         mbconv_name, self.channels[i], self.channels[i+1], self.feature_maps[i], self.strides[i]))
-                    
+
         else:
             predicted_latency = 200.0
             print('fail to predict the mobile latency')
-        return predicted_latency 
+        return predicted_latency
 
     def expected_latency(self, model):
         expected_latency = 0
@@ -135,11 +137,11 @@ class LatencyLoss(nn.Module):
         expected_latency += float(self._latency.get('7x7x1280-1000'))
 
         # mixed ops
-        #for i, layer in enumerate(model.module.layers):
+        # for i, layer in enumerate(model.module.layers):
         # mixed ops
         for i, layer in enumerate(model.module.layers):
             probs = layer.MixedOp.current_prob_over_ops
-            for i, op in enumerate(layer.MixedOp._op):
+            for i, op in enumerate(layer.MixedOp._ops):
                 if op is None or op.is_zero_layer():
                     continue
                 mbconv_name = model.candidate[i]
@@ -147,6 +149,7 @@ class LatencyLoss(nn.Module):
                     mbconv_name, self.channels[i], self.channels[i+1], self.feature_maps[i], self.strides[i]))
                 expected_latency = expected_latency + op_latency
         return expected_latency
+
 
 class FBNetLatencyLoss(nn.Module):
     def __init__(self, alpha, beta, channels, strides, input_size=112):

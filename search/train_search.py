@@ -5,9 +5,10 @@
 @LastEditTime: 2019-10-19 18:57:18
 @LastEditors: Please set LastEditors
 '''
-from imagenet_dataloader import get_imagenet_iter_torch
-import utils
+
 from config import SearchConfig
+import utils
+from imagenet_dataloader import get_imagenet_torch
 import os
 import sys
 import time
@@ -45,7 +46,7 @@ arch_logger_path = os.path.join(
 config.print_params(logger.info)
 
 # ref values
-ref_values={
+ref_values = {
     'flops': {
         '0.35': 59 * 1e6,
         '0.50': 97 * 1e6,
@@ -69,35 +70,26 @@ def main():
         logging.info('no gpu device available')
         sys.exit(1)
 
-    torch.cuda.set_device(config.local_rank % len(config.gpus))
-    torch.distributed.init_process_group(backend='nccl',
-                                         init_method = 'env://')
-    config.world_size=torch.distributed.get_world_size()
-    config.total_batch=config.world_size * config.batch_size
-
     np.random.seed(config.seed)
     torch.manual_seed(config.seed)
     torch.cuda.manual_seed_all(config.seed)
-    torch.backends.cudnn.benchmark=True
+    torch.backends.cudnn.benchmark = True
 
-    CLASSES=1000
-    channels=SEARCH_SPACE['channel_size']
-    strides=SEARCH_SPACE['strides']
+    CLASSES = 1000
+    channels = SEARCH_SPACE['channel_size']
+    strides = SEARCH_SPACE['strides']
 
     # Model
-    model=Network(channels, strides, CLASSES)
-    model=model.to(device)
-    model.apply(utils.weights_init)
-    model=DDP(model, delay_allreduce = True)
-    # For solve the custome loss can`t use model.parameters() in apex warpped model via https://github.com/NVIDIA/apex/issues/457 and https://github.com/NVIDIA/apex/issues/107
-    # model = torch.nn.parallel.DistributedDataParallel(
-    #    model, device_ids=[config.local_rank], output_device=config.local_rank)
+    model = Network(channels, strides, CLASSES)
+    model = model.to(device)
+    model = nn.DataParallel(model, device_ids=config.gpus)
     logger.info("param size = %fMB", utils.count_parameters_in_MB(model))
+    config.world_size = 0
 
     if config.target_hardware is None:
-        config.ref_value=None
+        config.ref_value = None
     else:
-        config.ref_value=ref_values[config.target_hardware]['%.2f' %
+        config.ref_value = ref_values[config.target_hardware]['%.2f' %
                                                               config.width_mult]
 
     # Loss
@@ -106,7 +98,7 @@ def main():
 
     alpha_weight = model.module.arch_parameters()
     # weight = [param for param in model.parameters() if not utils.check_tensor_in_list(param, alpha_weight)]
-    weight = model.weight_parameters()
+    weight = model.module.weight_parameters()
     # Optimizer
     w_optimizer = torch.optim.SGD(
         weight,
@@ -117,18 +109,18 @@ def main():
     alpha_optimizer = torch.optim.Adam(alpha_weight,
                                        lr=config.alpha_lr, betas=(config.arch_adam_beta1, config.arch_adam_beta2), eps=config.arch_adam_eps, weight_decay=config.alpha_weight_decay)
 
-    train_data = get_imagenet_iter_torch(
+    train_data = get_imagenet_torch(
         type='train',
         # image_dir="/googol/atlas/public/cv/ILSVRC/Data/"
         # use soft link `mkdir ./data/imagenet && ln -s /googol/atlas/public/cv/ILSVRC/Data/CLS-LOC/* ./data/imagenet/`
-        image_dir=config.data_path+config.dataset.lower(),
+        image_dir=config.data_path+"/"+config.dataset.lower(),
         batch_size=config.batch_size,
         num_threads=config.workers,
         world_size=config.world_size,
-        local_rank=config.local_rank,
-        crop=224, device_id=config.local_rank, num_gpus=config.gpus, portion=config.train_portion
+        crop=224, device_id=0, num_gpus=len(config.gpus), portion=config.train_portion
     )
-    valid_data = get_imagenet_iter_torch(
+
+    valid_data = get_imagenet_torch(
         type='val',
         # image_dir="/googol/atlas/public/cv/ILSVRC/Data/"
         # use soft link `mkdir ./data/imagenet && ln -s /googol/atlas/public/cv/ILSVRC/Data/CLS-LOC/* ./data/imagenet/`
@@ -136,11 +128,9 @@ def main():
         batch_size=config.batch_size,
         num_threads=config.workers,
         world_size=config.world_size,
-        local_rank=config.local_rank,
-        crop=224, device_id=config.local_rank, num_gpus=config.gpus, portion=config.val_portion
+        crop=224, device_id=0, num_gpus=len(config.gpus), portion=config.val_portion
     )
 
-    
     best_top1 = 0.
     best_genotype = list()
     lr = 0
@@ -152,26 +142,28 @@ def main():
     if config.resume:
         try:
             model_path = config.path + '/checkpoint.pth.tar'
-            model, w_optimizer, alpha_optimizer =  load_model(model, model_fname=model_path, optimizer = w_optimizer, arch_optimizer = alpha_optimizer)
+            model, w_optimizer, alpha_optimizer = load_model(
+                model, model_fname=model_path, optimizer=w_optimizer, arch_optimizer=alpha_optimizer)
         except Exception:
-            warmup_path = config.path +  '/warmup.pth.tar'
+            warmup_path = config.path + '/warmup.pth.tar'
             if os.path.exists(warmup_path):
                 print('load warmup weights')
-                model, w_optimizer,alpha_optimizer =  load_model(model, model_fname=warmup_path,
-                           optimizer=w_optimizer, arch_optimizer=alpha_optimizer)
+                model, w_optimizer, alpha_optimizer = load_model(model, model_fname=warmup_path,
+                                                                 optimizer=w_optimizer, arch_optimizer=alpha_optimizer)
             else:
                 print('fail to load models')
 
     w_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         w_optimizer, float(config.epochs), eta_min=config.w_lr_min)
+
     if config.start_epoch < 0 and config.warm_up:
         for epoch in range(config.warmup_epoch, config.warmup_epochs):
             # warmup
             train_top1, train_loss = warm_up(train_data, valid_data, model,
-                                            normal_critersion, criterion, w_optimizer,epoch, writer)
+                                             normal_critersion, criterion, w_optimizer, epoch, writer)
             config.start_epoch = epoch
 
-    update_schedule =  utils.get_update_schedule_grad(len(train_data), config)
+    update_schedule = utils.get_update_schedule_grad(len(train_data), config)
     for epoch in range(config.start_epoch + 1, config.epochs):
         if epoch > config.warmup_epochs:
             w_scheduler.step()
@@ -179,13 +171,14 @@ def main():
             logger.info('epoch %d lr %e', epoch, lr)
         # training
         train_top1, train_loss = train(train_data, valid_data, model,
-                                           normal_critersion, criterion, w_optimizer, alpha_optimizer, lr, epoch, writer, update_schedule)
+                                       normal_critersion, criterion, w_optimizer, alpha_optimizer, lr, epoch, writer, update_schedule)
         logger.info('Train top1 %f', train_top1)
 
         # validation
-        top1 = 0
+        top1 = train_top1
         if epoch % 10 == 0:
-            top1, loss = infer(valid_data, model, epoch, criterion, normal_critersion, writer)
+            top1, loss = infer(valid_data, model, epoch,
+                               criterion, normal_critersion, writer)
             logger.info('valid top1 %f', top1)
 
         genotype = model.module.genotype()
@@ -211,7 +204,7 @@ def main():
     logger.info("Best Genotype = {}".format(best_genotype))
 
 
-def warm_up(train_queue, valid_queue, model, criterion, Latency, optimizer,epoch, writer):
+def warm_up(train_queue, valid_queue, model, criterion, Latency, optimizer, epoch, writer):
     batch_time = utils.AverageMeters('Time', ':6.3f')
     data_time = utils.AverageMeters('Data', ':6.3f')
     losses = utils.AverageMeters('Loss', ':.4e')
@@ -235,7 +228,7 @@ def warm_up(train_queue, valid_queue, model, criterion, Latency, optimizer,epoch
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
         writer.add_scalar('warm-up/lr', lr, cur_step+step)
-        
+
         #### office warm up lr ####
 
         n = input.size(0)
@@ -247,7 +240,7 @@ def warm_up(train_queue, valid_queue, model, criterion, Latency, optimizer,epoch
         model.module.unused_modules_off()
 
         logits = model(input)
-        if config.label_smooth > 0:
+        if config.label_smooth > 0 and epoch > config.warmup_epochs:
             loss = utils.cross_entropy_with_label_smoothing(
                 logits, target, config.label_smooth)
         else:
@@ -257,13 +250,9 @@ def warm_up(train_queue, valid_queue, model, criterion, Latency, optimizer,epoch
         optimizer.step()
 
         acc1, acc5 = utils.accuracy(logits, target, topk=(1, 5))
-        reduced_loss = reduce_tensor(loss.data, world_size=config.world_size)
-        acc1 = reduce_tensor(acc1, world_size=config.world_size)
-        acc5 = reduce_tensor(acc5, world_size=config.world_size)
-
-        losses.update(to_python_float(reduced_loss), n)
-        top1.update(to_python_float(acc1), n)
-        top5.update(to_python_float(acc5), n)
+        losses.update(loss, n)
+        top1.update(acc1, n)
+        top5.update(acc5, n)
 
         # unused modules back
         model.module.unused_modules_back()
@@ -295,8 +284,8 @@ def warm_up(train_queue, valid_queue, model, criterion, Latency, optimizer,epoch
     else:
         latency = Latency.predict_latency(model)
     # unused modules back
-    logger.info('Warmup Valid [{0}/{1}]\tloss {2:.3f}\ttop-1 acc {3:.3f}\ttop-5 acc ' \
-                      '{4:.3f}\tflops: {5:.1f}M {6:.3f}ms'.
+    logger.info('Warmup Valid [{0}/{1}]\tloss {2:.3f}\ttop-1 acc {3:.3f}\ttop-5 acc '
+                '{4:.3f}\tflops: {5:.1f}M {6:.3f}ms'.
                 format(epoch, config.warmup_epochs, valid_loss, valid_top1, valid_top5, flops / 1e6, latency))
     model.module.unused_modules_back()
 
@@ -307,15 +296,16 @@ def warm_up(train_queue, valid_queue, model, criterion, Latency, optimizer,epoch
         if 'alpha' in key or 'path' in key:
             state_dict.pop(key)
     checkpoint = {
-                'state_dict': state_dict,
-                'warmup': config.warmup,
-            }
+        'state_dict': state_dict,
+        'warmup': config.warmup,
+    }
     if config.warmup:
         checkpoint['warmup_epoch'] = epoch
 
     checkpoint['epoch'] = epoch
     checkpoint['w_optimizer'] = optimizer.state_dict()
-    save_model(model, checkpoint,model_name='warmup.pth.tar')
+
+    save_model(model, checkpoint, model_name='warmup.pth.tar')
     return top1.avg, losses.avg
 
 
@@ -342,13 +332,10 @@ def validate_warmup(valid_queue, model, epoch, criterion, writer):
             loss = criterion(logits, target)
             acc1, acc5 = utils.accuracy(logits, target, topk=(1, 5))
             n = input.size(0)
-            reduced_loss = reduce_tensor(
-                loss.data, world_size=config.world_size)
-            acc1 = reduce_tensor(acc1, world_size=config.world_size)
-            acc5 = reduce_tensor(acc5, world_size=config.world_size)
-            losses.update(to_python_float(reduced_loss), n)
-            top1.update(to_python_float(acc1), n)
-            top5.update(to_python_float(acc5), n)
+
+            losses.update(loss, n)
+            top1.update(acc1, n)
+            top5.update(acc5, n)
 
             # measure elapsed time
             batch_time.update(time.time() - end)
@@ -416,13 +403,10 @@ def train(train_queue, valid_queue, model, criterion, LatencyLoss, optimizer, al
             loss = criterion(logits, target)
 
         acc1, acc5 = utils.accuracy(logits, target, topk=(1, 5))
-        reduced_loss = reduce_tensor(loss.data, world_size=config.world_size)
-        acc1 = reduce_tensor(acc1, world_size=config.world_size)
-        acc5 = reduce_tensor(acc5, world_size=config.world_size)
 
-        losses.update(to_python_float(reduced_loss), n)
-        top1.update(to_python_float(acc1), n)
-        top5.update(to_python_float(acc5), n)
+        losses.update(loss, n)
+        top1.update(acc1, n)
+        top5.update(acc5, n)
         model.zero_grad()
 
         loss.backward()
@@ -439,24 +423,26 @@ def train(train_queue, valid_queue, model, criterion, LatencyLoss, optimizer, al
             # T_totol = config.warmup_eforhs * len(train_queue)
             # lr = 0.5 * lr_max * (1 + math.cos(math.pi * T_cur / T_total))
             #### office warm up lr ####
-            for j in range (update_schedule.get(step, 0)):
+            for j in range(update_schedule.get(step, 0)):
                 model.train()
                 latency_loss = 0
                 expected_loss = 0
-                
+
                 valid_iter = iter(valid_queue)
                 input_valid, target_valid = next(valid_iter)
                 # alpha_optimizer.zero_grad()
                 input_valid = Variable(input_valid, requires_grad=False).cuda()
                 # target = Variable(target, requires_grad=False).cuda(async=True)
-                target_valid = Variable(target_valid, requires_grad=False).cuda()
+                target_valid = Variable(
+                    target_valid, requires_grad=False).cuda()
                 model.module.reset_binary_gates()
                 model.module.unused_modules_off()
-                output_valid = model(input_valid).torch().float()
+                output_valid = model(input_valid).float()
                 loss_ce = criterion(output_valid, target_valid)
                 expected_loss = LatencyLoss.expected_latency(model)
                 expected_loss_tensor = torch.cuda.FloatTensor([expected_loss])
-                latency_loss = LatencyLoss(loss_ce, expected_loss_tensor, config)
+                latency_loss = LatencyLoss(
+                    loss_ce, expected_loss_tensor, config)
                 # compute gradient and do SGD step
                 # zero grads of weight_param, arch_param & binary_param
                 model.zero_grad()
@@ -466,9 +452,8 @@ def train(train_queue, valid_queue, model, criterion, LatencyLoss, optimizer, al
                 alpha_optimizer.step()
                 model.module.rescale_updated_arch_param()
                 model.module.unused_modules_back()
-                log_str = 'Architecture [%d-%d]\t Loss %.4f\t %s LatencyLoss: %s' %
-                        (epoch, step, latency_loss,
-                        config.target_hardware, expected_loss)
+                log_str = 'Architecture [%d-%d]\t Loss %.4f\t %s LatencyLoss: %s' % (epoch, step, latency_loss,
+                                                                                     config.target_hardware, expected_loss)
                 utils.write_log(arch_logger_path, log_str)
 
         # measure elapsed time
@@ -486,7 +471,7 @@ def train(train_queue, valid_queue, model, criterion, LatencyLoss, optimizer, al
     return top1.avg, losses.avg
 
 
-def infer(valid_queue, model, epoch, Latency,criterion, writer):
+def infer(valid_queue, model, epoch, Latency, criterion, writer):
     batch_time = utils.AverageMeters('Time', ':6.3f')
     losses = utils.AverageMeters('Loss', ':.4e')
     top1 = utils.AverageMeters('Acc@1', ':6.2f')
@@ -514,13 +499,10 @@ def infer(valid_queue, model, epoch, Latency,criterion, writer):
             loss = criterion(logits, target)
             acc1, acc5 = utils.accuracy(logits, target, topk=(1, 5))
             n = input.size(0)
-            reduced_loss = reduce_tensor(
-                loss.data, world_size=config.world_size)
-            acc1 = reduce_tensor(acc1, world_size=config.world_size)
-            acc5 = reduce_tensor(acc5, world_size=config.world_size)
-            losses.update(to_python_float(reduced_loss), n)
-            top1.update(to_python_float(acc1), n)
-            top5.update(to_python_float(acc5), n)
+
+            losses.update(loss, n)
+            top1.update(acc1, n)
+            top5.update(acc5, n)
 
             # measure elapsed time
             batch_time.update(time.time() - end)
@@ -566,27 +548,28 @@ def to_python_float(t):
     else:
         return t[0]
 
+
 def save_model(model, checkpoint=None, is_best=False, model_name=None):
-        if checkpoint is None:
-            checkpoint = {'state_dict': model.module.state_dict()}
+    if checkpoint is None:
+        checkpoint = {'state_dict': model.state_dict()}
 
-        if model_name is None:
-            model_name = 'checkpoint.pth.tar'
+    if model_name is None:
+        model_name = 'checkpoint.pth.tar'
 
-        checkpoint['dataset'] = config.dataset # add `dataset` info to the checkpoint
-        latest_fname = os.path.join(config.path, 'latest.txt')
-        model_path = os.path.join(config.path, model_name)
-        with open(latest_fname, 'w') as fout:
-            fout.write(model_path + '\n')
-        torch.save(checkpoint, model_path)
+    # add `dataset` info to the checkpoint
+    checkpoint['dataset'] = config.dataset
+    latest_fname = os.path.join(config.path, 'latest.txt')
+    model_path = os.path.join(config.path, model_name)
+    with open(latest_fname, 'w') as fout:
+        fout.write(model_path + '\n')
+    torch.save(checkpoint, model_path)
 
-        if is_best:
-            best_path = os.path.join(config.path, 'model_best.pth.tar')
-            torch.save({'state_dict': checkpoint['state_dict']}, best_path)
+    if is_best:
+        best_path = os.path.join(config.path, 'model_best.pth.tar')
+        torch.save({'state_dict': checkpoint['state_dict']}, best_path)
 
 
-
-def load_model(model=None,model_fname=None, optimizer=None, arch_optimizer=None):
+def load_model(model=None, model_fname=None, optimizer=None, arch_optimizer=None):
     latest_fname = os.path.join(config.path, 'latest.txt')
     if model_fname is None and os.path.exists(latest_fname):
         with open(latest_fname, 'r') as fin:
@@ -626,7 +609,7 @@ def load_model(model=None,model_fname=None, optimizer=None, arch_optimizer=None)
         config.warmup = checkpoint['warmup']
     if config.warmup and 'warmup_epoch' in checkpoint:
         config.warmup_epoch = checkpoint['warmup_epoch']
-    
+
     return model, optimizer, arch_optimizer
 
 

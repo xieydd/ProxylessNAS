@@ -131,6 +131,39 @@ def get_imagenet_iter_torch(type, image_dir, batch_size, num_threads, device_id,
     return dataloader
 
 
+def get_imagenet_torch(type, image_dir, batch_size, num_threads, device_id, num_gpus, crop, val_size=256,
+                            world_size=1, local_rank=0, portion=1.0):
+    if type == 'train':
+        transform = transforms.Compose([
+            transforms.RandomResizedCrop(crop, scale=(0.08, 1.25)),
+            transforms.RandomHorizontalFlip(),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[
+                                 0.229, 0.224, 0.225]),
+        ])
+        dataset = datasets.ImageFolder(image_dir + '/train', transform)
+        num_train = len(dataset)
+        indices = list(range(num_train))
+        split = int(np.floor(portion * num_train))
+        dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, sampler=torch.utils.data.sampler.SubsetRandomSampler(
+            indices[:split]), num_workers=num_threads, pin_memory=True)
+        return dataloader
+    else:
+        transform = transforms.Compose([
+            transforms.Resize(val_size),
+            transforms.CenterCrop(crop),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[
+                                 0.229, 0.224, 0.225]),
+        ])
+        dataset = datasets.ImageFolder(image_dir + '/val_bak', transform)
+        num_train = len(dataset)
+        indices = list(range(num_train))
+        split = int(np.floor(portion * num_train))
+        dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, sampler=torch.utils.data.sampler.SubsetRandomSampler(indices[:split]), shuffle=False, num_workers=num_threads,
+                                                 pin_memory=True)
+        return dataloader
+
 
 class DALIWrapper(object):
     def gen_wrapper(dalipipeline):
